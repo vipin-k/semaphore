@@ -1,0 +1,208 @@
+---
+- hosts: localhost
+  remote_user: root
+  vars:
+    mysql_database: semaphore
+    mysql_hostname: localhost
+    mysql_username: semaphore
+    mysql_password: semaphore
+    mysql_port: 3306
+    playbook_path: /home/ansible/semaphore
+    web_root:
+    output_dir: /usr/local/bin/
+    admin_username: admin
+    admin_email: admin@vipin.io
+    admin_desc: "Vipin Kumar"
+    admin_password: admin
+    semaphore_binary: https://github.com/ansible-semaphore/semaphore/releases/download/v2.5.1/semaphore_2.5.1_linux_amd64.tar.gz
+  tasks:
+
+  - name: remove mysql packages for mariadb
+    yum:
+      name: "{{ item }}"
+      state: removed
+    with_items:
+      - mysql-community-common
+      - mysql-community-libs
+      - mysql-community-libs-compat
+
+  - name: install mariadb, postfix and libsemanage-python
+    yum:
+      name: "{{ item }}"
+      state: installed
+    with_items:
+      - mariadb-server
+      - postfix
+      - libsemanage-python
+
+  - name: set mariadb to be enabled at boot en start it
+    systemd:
+      name: mariadb
+      enabled: yes
+      state: started
+      daemon_reload: yes
+
+  - name: add wandisco repo for git 2.x
+    yum_repository:
+      name: wandisco
+      description: wandisco repo
+      baseurl: http://opensource.wandisco.com/rhel/$releasever/git/$basearch
+      gpgkey: http://opensource.wandisco.com/RPM-GPG-KEY-WANdisco
+
+  - name: install git 2.x
+    yum:
+      name: git
+      state: latest
+
+  - name: disable wandisco repo
+    yum_repository:
+      name: wandisco
+      description: wandisco repo
+      baseurl: http://opensource.wandisco.com/rhel/$releasever/git/$basearch
+      enabled: no
+
+  - name: create ansible user
+    user:
+      name: ansible
+      state: present
+
+  - name: get semaphore binary
+    unarchive:
+      src: "{{ semaphore_binary }}"
+      dest: /usr/local/bin/
+      remote_src: yes
+
+
+  - name: setup mysql
+    shell: |
+      mysql -u root -e "create database if not exists {{ mysql_database }};"
+      mysql -u root -e "grant all on {{ mysql_database }}.* to '{{ mysql_username }}'@'localhost' identified by '{{ mysql_password }}';"
+
+  - name: create playbook path
+    file:
+      dest: "{{ playbook_path }}"
+      state: directory
+      owner: ansible
+      group: ansible
+
+  - name: create semaphore config file
+    shell: |
+      echo "{{ mysql_hostname }}:{{ mysql_port }}
+            {{ mysql_username }}
+            {{ mysql_password }}
+            {{ mysql_database }}
+            {{ playbook_path }}
+            {{ web_root }}
+            no
+            no
+            no
+            yes
+            {{ output_dir }}
+            {{ admin_username }}
+            {{ admin_email }}
+            {{ admin_desc }}
+            {{ admin_password }}" > {{ playbook_path }}/semaphore.conf
+    args:
+      creates: "{{ playbook_path }}/semaphore.conf"
+    become_user: ansible
+
+  - name: semaphore setup
+    shell: >
+      /usr/local/bin/semaphore -setup < {{ playbook_path }}/semaphore.conf
+    #args:
+      #creates: "{{ playbook_path }}/semaphore_config.json"
+    become_user: ansible
+
+  - name: create logging directory in /var/log/semaphore
+    file:
+      dest: /var/log/semaphore
+      state: directory
+      owner: ansible
+      group: ansible
+
+  - name: create a semaphore systemd service file
+    shell: |
+      echo "[Unit]
+            Description=The Ansible Semaphore server
+            After=network.target
+
+            [Service]
+            Type=simple
+            User=ansible
+            Group=ansible
+            ExecStart=/bin/sh -c '/usr/local/bin/semaphore -config /usr/local/bin/config.json >> /var/log/semaphore/semaphore.log 2>&1'
+            KillSignal=SIGKILL
+            PrivateTmp=true
+
+            [Install]
+            WantedBy=multi-user.target" > /usr/lib/systemd/system/semaphore.service
+    args:
+      creates: /usr/lib/systemd/system/semaphore.service
+
+  - name: set semaphore to be enabled at boot and start it
+    systemd:
+      name: semaphore
+      enabled: yes
+      state: started
+      daemon_reload: yes
+
+  - name: install nginx for semaphore ssl access
+    yum:
+      name: nginx
+      state: installed
+
+  - name: create self signed certificate for ssl
+    shell: >
+      openssl req -new -nodes -x509 -subj "/C=NL/ST=Noord Holland/L=Lutjebroek/CN={{ ansible_fqdn }}" -days 3650 -keyout /etc/nginx/server.key -out /etc/nginx/server.crt -extensions v3_ca
+    args:
+      creates: /etc/nginx/server.crt
+
+  - name: generate nginx ssl config
+    shell: |
+      echo "worker_processes  1;
+            events {
+              worker_connections  1024;
+            }
+            http {
+              include /etc/nginx/mime.types;
+              gzip  on;
+              gzip_http_version 1.1;
+              gzip_comp_level 2;
+              gzip_types text/plain text/css application/x-javascript text/xml application/xml application/xml+rss text/javascript;
+              server {
+                listen *:443;
+                ssl on;
+                server_name {{ ansible_fqdn }};
+                ssl_certificate /etc/nginx/server.crt;
+                ssl_certificate_key /etc/nginx/server.key;
+                location / {
+                  proxy_pass http://127.0.0.1:3000;
+                }
+              }
+            }" > /etc/nginx/nginx.conf
+
+  - name: restart nginx service
+    systemd:
+      name: nginx
+      enabled: yes
+      state: restarted
+
+  - name: set firewalld to be enabled at boot and start it
+    systemd:
+      name: firewalld
+      enabled: yes
+      state: started
+
+  - name: enable https port in the firewall
+    firewalld:
+      port: 443/tcp
+      state: enabled
+      permanent: yes
+      immediate: yes
+
+  - name: set seboolean httpd to allow network connections
+    seboolean:
+      name: httpd_can_network_connect
+      state: yes
+      persistent: yes
+
